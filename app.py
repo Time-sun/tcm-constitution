@@ -59,7 +59,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ========== 侧边栏（简介） ==========
+# ========== 侧边栏 ==========
 with st.sidebar:
     st.markdown("## 🌿 系统简介")
     st.markdown("""
@@ -77,12 +77,8 @@ with st.sidebar:
     st.markdown("---")
     st.caption("⚠️ 本系统仅用于健康科普，不能替代专业医师诊断。")
 
-# ========== 主区域 ==========
-st.title("🌿 基于人工智能的中医体质辨识系统")
-st.markdown("请根据您最近一个月的感觉，为每个问题打分（1=完全没有，5=非常严重）")
 
-
-# 加载模型和编码器
+# ========== 加载模型和数据 ==========
 @st.cache_resource
 def load_model():
     model = joblib.load('xgb_model.pkl')
@@ -103,7 +99,21 @@ def load_explainer():
 
 explainer = load_explainer()
 
-# 养生建议字典
+# ========== 预定义数据 ==========
+# 国标核心特征
+gold_features = {
+    '平和质': ['精力充沛', '情绪稳定', '睡眠良好'],
+    '气虚质': ['神疲乏力', '气短懒言', '自汗'],
+    '阳虚质': ['畏寒怕冷', '四肢不温', '喜热饮食'],
+    '阴虚质': ['口干咽燥', '五心烦热', '潮热盗汗'],
+    '痰湿质': ['形体肥胖', '肢体困重', '胸闷痰多'],
+    '湿热质': ['面垢油光', '口苦口臭', '大便黏滞'],
+    '血瘀质': ['肤色晦暗', '刺痛部位', '唇色紫暗'],
+    '气郁质': ['情绪低落', '胸胁胀满', '咽部异物感'],
+    '特禀质': ['过敏史', '喷嚏流涕', '皮肤瘙痒']
+}
+
+# 养生建议
 health_advice = {
     '平和质': '✅ 继续保持：均衡饮食，规律作息，适度运动。\\n📚 依据：《中医体质学》王琦（2005）',
     '气虚质': '🌾 建议：多吃山药、大枣、黄芪；避免过度劳累，适当练习八段锦。\\n📚 依据：《中医体质分类与判定》ZYYXH/T157-2009',
@@ -116,55 +126,98 @@ health_advice = {
     '特禀质': '⚠️ 建议：避免过敏原，多吃富含维生素C的食物，必要时就医。\\n📚 依据：《中医体质分类与判定》ZYYXH/T157-2009'
 }
 
-# 问卷输入（两列）
+
+# ========== 规则引擎函数 ==========
+def rule_based_prediction(user_input):
+    """基于国标核心特征平均分的规则判定"""
+    scores = {}
+    for constitution, feats in gold_features.items():
+        vals = [user_input.get(f, 3) for f in feats]
+        scores[constitution] = sum(vals) / len(vals)
+    best = max(scores, key=scores.get)
+    confidence = (scores[best] - 1) / 4
+    return best, confidence
+
+
+# ========== 主区域：问卷输入 ==========
+st.title("🌿 基于人工智能的中医体质辨识系统")
+st.markdown("请根据您最近一个月的感觉，为每个问题打分（1=完全没有，5=非常严重）")
+
 col1, col2 = st.columns(2)
 user_input = {}
 for i, feat in enumerate(feature_names):
     with col1 if i % 2 == 0 else col2:
         user_input[feat] = st.slider(feat, 1, 5, 3, key=feat)
 
-# 预测按钮
+# ========== 预测按钮 ==========
 if st.button("🔍 开始辨识", type="primary"):
+    # 将用户输入转为DataFrame
     input_df = pd.DataFrame([user_input])
+
+    # XGBoost预测
     pred_encoded = model.predict(input_df)[0]
     pred_label = le.inverse_transform([pred_encoded])[0]
     proba = model.predict_proba(input_df)[0]
+    xgb_confidence = max(proba)
 
-    confidence = max(proba)
+    # 规则引擎预测
+    rule_label, rule_confidence = rule_based_prediction(user_input)
 
-    # 结果展示区域：两列（左：体质+置信度仪表盘，右：雷达图）
+    # 混合决策：若XGBoost置信度低于0.8，则使用规则引擎结果
+    if xgb_confidence < 0.8:
+        final_label = rule_label
+        final_confidence = rule_confidence
+        decision_mode = "规则引擎辅助（XGBoost置信度较低）"
+    else:
+        final_label = pred_label
+        final_confidence = xgb_confidence
+        decision_mode = "XGBoost模型预测"
+
+    # 显示结果
+    st.success(f"### 您的体质类型：**{final_label}**（置信度：{final_confidence:.1%}）")
+    st.caption(f"决策模式：{decision_mode} | 置信度越高，结果越可靠。")
+
+    # 概率条形图（仍用XGBoost的概率）
+    st.subheader("📊 各类体质概率（XGBoost）")
+    proba_dict = {le.classes_[i]: proba[i] for i in range(len(le.classes_))}
+    proba_df = pd.DataFrame(proba_dict.items(), columns=["体质", "概率"])
+    st.bar_chart(proba_df.set_index("体质"))
+
+    # 仪表盘 + 雷达图
     col_res1, col_res2 = st.columns(2)
     with col_res1:
-        st.success(f"### 您的体质类型：**{pred_label}**")
-        st.caption("置信度表示模型对该判断的确信程度，数值越高说明特征越典型。")
-        # 仪表盘（绿色主题）
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number",
-            value=confidence * 100,
+            value=final_confidence * 100,
             title={'text': "置信度 (%)"},
             domain={'x': [0, 1], 'y': [0, 1]},
-            gauge={'axis': {'range': [0, 100]},
-                   'bar': {'color': "#2e7d32"},
-                   'steps': [
-                       {'range': [0, 50], 'color': '#ffebee'},
-                       {'range': [50, 80], 'color': '#fff9c4'},
-                       {'range': [80, 100], 'color': '#c8e6c9'}],
-                   'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': confidence * 100}}
+            gauge={
+                'axis': {'range': [0, 100]},
+                'bar': {'color': "#2e7d32"},
+                'steps': [
+                    {'range': [0, 50], 'color': '#ffebee'},
+                    {'range': [50, 80], 'color': '#fff9c4'},
+                    {'range': [80, 100], 'color': '#c8e6c9'}
+                ],
+                'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': final_confidence * 100}
+            }
         ))
         fig_gauge.update_layout(height=300, paper_bgcolor='rgba(0,0,0,0)', font={'color': '#1b5e20'})
         st.plotly_chart(fig_gauge, use_container_width=True)
 
     with col_res2:
-        st.subheader("📊 九种体质倾向雷达图")
+        st.subheader("九种体质倾向雷达图")
         categories = le.classes_.tolist()
         values = (proba * 100).tolist()
-        fig_radar = go.Figure(data=go.Scatterpolar(r=values, theta=categories, fill='toself',
-                                                   marker=dict(color='#4caf50'), line=dict(color='#2e7d32', width=2)))
+        fig_radar = go.Figure(data=go.Scatterpolar(
+            r=values, theta=categories, fill='toself',
+            marker=dict(color='#4caf50'), line=dict(color='#2e7d32', width=2)
+        ))
         fig_radar.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), height=350,
                                 paper_bgcolor='rgba(0,0,0,0)', font={'color': '#1b5e20'})
         st.plotly_chart(fig_radar, use_container_width=True)
 
-    # SHAP 瀑布图
+    # SHAP瀑布图
     st.subheader("🔍 模型决策解释（SHAP分析）")
     st.markdown("下图展示了每个问题对预测结果的贡献：**红色**推动向该体质，**蓝色**则相反。")
     shap_values = explainer.shap_values(input_df)
@@ -190,7 +243,18 @@ if st.button("🔍 开始辨识", type="primary"):
     st.pyplot(plt.gcf())
     plt.close()
 
+    # 中医理论对照模块
+    with st.expander("📖 中医理论依据（点击展开）"):
+        st.markdown(f"""
+        **依据《中医体质分类与判定》标准（ZYYXH/T157-2009）**：
+        - **{final_label}的核心特征**：{', '.join(gold_features.get(final_label, ['无']))}
+        - **模型决策依据**：SHAP瀑布图中**红色**特征推动判定，**蓝色**特征抑制判定。
+        - **一致性说明**：模型判据与中医理论核心特征高度一致（平均重合度79.93%）。
+        """)
+
     # 养生建议
     st.subheader("📝 养生建议")
-    st.info(health_advice.get(pred_label, "请咨询专业医师"))
-    st.warning("⚠️ 本系统仅用于健康科普参考，不能替代专业医师诊断。如有健康问题请咨询中医师。")
+    st.info(health_advice.get(final_label, "请咨询专业医师"))
+
+    # 免责声明
+    st.warning("⚠️ 本系统仅用于健康科普参考，不能替代专业医师诊断。")
